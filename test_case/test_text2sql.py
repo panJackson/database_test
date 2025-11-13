@@ -601,21 +601,51 @@ def generate_sql_with_openai(question: str, prompt: str, model: str = "gpt-4o") 
 
 
 def generate_sql_with_google(question: str, prompt: str, model: str = "gemini-2.0-flash-exp") -> Tuple[Optional[str], Optional[str]]:
-    """使用 Google 模型生成 SQL"""
+    """使用 Google 模型生成 SQL
+    
+    注意：此函数使用 Google AI Studio (Gemini API)，需要使用从 Google AI Studio 获取的 API Key。
+    不要使用 Google Cloud Console 创建的 API Key，那是用于 Google Cloud API 的。
+    """
     if genai is None:
         return None, "Google Generative AI 库未安装"
     
     try:
-        api_key = os.getenv("GOOGLE_API_KEY")
+        # 尝试多种方式获取 API Key
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         if not api_key:
-            return None, "未设置 GOOGLE_API_KEY 环境变量"
+            return None, (
+                "未设置 GOOGLE_API_KEY 或 GEMINI_API_KEY 环境变量。\n"
+                "请从 Google AI Studio 获取 API Key: https://makersuite.google.com/app/apikey\n"
+                "注意：必须使用 Google AI Studio 的 API Key，不是 Google Cloud Console 的 API Key。"
+            )
         
+        # 检查 API Key 格式
+        api_key = api_key.strip()
+        if len(api_key) < 20:
+            return None, (
+                f"API Key 格式可能不正确（长度过短: {len(api_key)} 字符）。\n"
+                f"Google AI Studio API Key 通常为 39 个字符，以 'AIza' 开头。\n"
+                f"请确认使用的是 Google AI Studio 的 API Key: https://makersuite.google.com/app/apikey"
+            )
+        
+        # 验证 API Key 格式（Google AI Studio API Key 通常以 AIza 开头）
+        if not api_key.startswith("AIza"):
+            return None, (
+                f"API Key 格式可能不正确（不以 'AIza' 开头）。\n"
+                f"请确认使用的是 Google AI Studio 的 API Key，而不是 Google Cloud Console 的 API Key。\n"
+                f"获取正确的 API Key: https://makersuite.google.com/app/apikey\n"
+                f"当前 API Key 前缀: {api_key[:10]}..."
+            )
+        
+        # 配置 API Key（每次调用前重新配置，确保使用最新的 key）
         genai.configure(api_key=api_key)
         
+        # 创建模型实例
         model_instance = genai.GenerativeModel(model)
         
         full_prompt = f"{prompt}\n\n用户问题：{question}\n\n请只返回 SQL 语句："
         
+        # 生成内容
         response = model_instance.generate_content(
             full_prompt,
             generation_config=genai.types.GenerationConfig(temperature=0.1)
@@ -626,7 +656,37 @@ def generate_sql_with_google(question: str, prompt: str, model: str = "gemini-2.
         
         return sql, None
     except Exception as e:
-        return None, f"Google API 错误: {str(e)}"
+        error_msg = str(e)
+        
+        # 提供更详细的错误诊断
+        if "401" in error_msg or "CREDENTIALS_MISSING" in error_msg or "API keys are not supported" in error_msg:
+            diagnostic_msg = (
+                f"Google API 认证失败: {error_msg}\n\n"
+                f"⚠️  重要提示：\n"
+                f"这个错误通常表示您使用了错误的 API Key 类型。\n\n"
+                f"✅ 正确的做法：\n"
+                f"1. 访问 Google AI Studio: https://makersuite.google.com/app/apikey\n"
+                f"2. 创建或获取 API Key（用于 Gemini API）\n"
+                f"3. 确保 API Key 以 'AIza' 开头，长度约 39 个字符\n"
+                f"4. 将此 API Key 设置为 GOOGLE_API_KEY 环境变量\n\n"
+                f"❌ 常见错误：\n"
+                f"- 不要使用 Google Cloud Console (console.cloud.google.com) 创建的 API Key\n"
+                f"- Google Cloud API Key 用于 Google Cloud 服务，不支持 Gemini API\n"
+                f"- 必须使用 Google AI Studio 的 API Key\n\n"
+                f"当前检测到的 API Key 前缀: {api_key[:10] if api_key else 'None'}...\n"
+                f"API Key 长度: {len(api_key) if api_key else 0} 字符"
+            )
+            return None, diagnostic_msg
+        elif "403" in error_msg or "PERMISSION_DENIED" in error_msg:
+            return None, (
+                f"Google API 权限错误: {error_msg}\n"
+                f"请确认 API Key 有访问 Generative Language API 的权限\n"
+                f"如果问题持续，请尝试重新生成 API Key: https://makersuite.google.com/app/apikey"
+            )
+        elif "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+            return None, f"Google API 配额已用完: {error_msg}\n请检查 API 使用配额或稍后重试"
+        else:
+            return None, f"Google API 错误: {error_msg}"
 
 
 # 危险 SQL 关键字（会对数据库造成修改的操作）
@@ -657,13 +717,14 @@ def detect_dangerous_sql(sql: str) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
-def execute_sql_safely(sql: str, db_name: str = None, db_config: Dict = None) -> Tuple[bool, str, Optional[List[Dict]]]:
+def execute_sql_safely(sql: str, db_name: str = None, db_config: Dict = None, allowed_tables: set = None) -> Tuple[bool, str, Optional[List[Dict]]]:
     """安全执行 SQL 并返回结果
     
     Args:
         sql: SQL 语句
         db_name: 数据库名称标识（用于从配置中获取）
         db_config: 数据库配置字典（如果提供则直接使用）
+        allowed_tables: 允许访问的表名集合（如果为 None，则使用默认的 ALLOWED_TABLES）
         
     Returns:
         Tuple[bool, str, Optional[List[Dict]]]: (是否成功, 消息, 结果)
@@ -673,8 +734,11 @@ def execute_sql_safely(sql: str, db_name: str = None, db_config: Dict = None) ->
     
     try:
         # 检查 SQL 安全性
+        # 使用传入的 allowed_tables，如果没有则使用默认的
+        if allowed_tables is None:
+            allowed_tables = ALLOWED_TABLES
         # 将允许的表名转换为大写集合
-        allowed_tables_upper = {table.upper() for table in ALLOWED_TABLES}
+        allowed_tables_upper = {table.upper() for table in allowed_tables}
         ok, msg = is_safe_sql(sql, allowed_tables_upper, MAX_ROWS)
         if not ok:
             return False, msg, None
@@ -693,8 +757,18 @@ def execute_sql_safely(sql: str, db_name: str = None, db_config: Dict = None) ->
         return False, f"执行异常: {str(e)}", None
 
 
-def test_question(question: str, prompt: str, model_type: str, model_name: str, db_name: str = None, db_config: Dict = None) -> Dict:
-    """测试单个问题的 SQL 生成和执行"""
+def test_question(question: str, prompt: str, model_type: str, model_name: str, db_name: str = None, db_config: Dict = None, allowed_tables: set = None) -> Dict:
+    """测试单个问题的 SQL 生成和执行
+    
+    Args:
+        question: 问题文本
+        prompt: 提示词
+        model_type: 模型类型 ("openai" 或 "google")
+        model_name: 模型名称
+        db_name: 数据库名称标识
+        db_config: 数据库配置字典
+        allowed_tables: 允许访问的表名集合
+    """
     result = {
         "question": question,
         "prompt": prompt,
@@ -737,8 +811,8 @@ def test_question(question: str, prompt: str, model_type: str, model_name: str, 
         result["error"] = f"检测到危险操作: {dangerous_keyword}"
         return result
     
-    # 执行 SQL（使用传入的数据库配置）
-    success, msg, results = execute_sql_safely(sql, db_name=db_name, db_config=db_config)
+    # 执行 SQL（使用传入的数据库配置和允许的表列表）
+    success, msg, results = execute_sql_safely(sql, db_name=db_name, db_config=db_config, allowed_tables=allowed_tables)
     result["success"] = success
     if not success:
         result["error"] = msg
@@ -804,6 +878,22 @@ def load_test_cases(testcase_file: str) -> Tuple[List[Dict], Dict]:
     # 获取数据库配置
     database_configs = data.get("database", {})
     
+    # 定义不同测试组对应的允许表列表
+    TABLE_MAPPING = {
+        "tennis": {
+            "sportradar_tennis_competition",
+            "sportradar_tennis_season",
+            "sportradar_tennis_competitor",
+            "sportradar_tennis_summary_live"
+        },
+        "football": {
+            "sport_football_schedule"
+        },
+        "basketball": {
+            "sport_basketball_schedule"
+        }
+    }
+    
     # 为每个测试组补充默认值和数据库配置
     for group in test_groups:
         if "prompt" not in group:
@@ -833,6 +923,22 @@ def load_test_cases(testcase_file: str) -> Tuple[List[Dict], Dict]:
             # 如果没有指定，使用默认数据库
             group["db_name"] = DEFAULT_DB_NAME
             group["db_config"] = None
+        
+        # 处理允许的表列表
+        # 优先使用配置中的 allowed_tables，否则根据测试组名称推断
+        if "allowed_tables" in group:
+            # 如果配置中指定了 allowed_tables，使用配置的值
+            group["allowed_tables"] = set(group["allowed_tables"])
+        else:
+            # 根据测试组名称推断允许的表
+            group_name = group.get("name", "").lower()
+            if group_name in TABLE_MAPPING:
+                group["allowed_tables"] = TABLE_MAPPING[group_name]
+            elif group_db_name and group_db_name in TABLE_MAPPING:
+                group["allowed_tables"] = TABLE_MAPPING[group_db_name]
+            else:
+                # 默认使用网球表（向后兼容）
+                group["allowed_tables"] = ALLOWED_TABLES
     
     return test_groups, defaults
 
@@ -876,6 +982,7 @@ def run_tests(testcase_file: str, openai_model: str = None, google_model: str = 
         questions = group.get("questions", [])
         group_db_name = group.get("db_name", DEFAULT_DB_NAME)
         group_db_config = group.get("db_config")
+        group_allowed_tables = group.get("allowed_tables", ALLOWED_TABLES)
         
         print("\n" + "=" * 80)
         print(f"测试组 {group_idx}: {group_name}")
@@ -884,6 +991,7 @@ def run_tests(testcase_file: str, openai_model: str = None, google_model: str = 
         print(f"  数据库: {group_db_name}")
         if group_db_config:
             print(f"  数据库主机: {group_db_config.get('host', 'N/A')}")
+        print(f"  允许的表: {', '.join(sorted(group_allowed_tables))}")
         print(f"  问题数量: {len(questions)}")
         print("=" * 80)
         
@@ -897,7 +1005,8 @@ def run_tests(testcase_file: str, openai_model: str = None, google_model: str = 
                 for i, question in enumerate(questions, 1):
                     print(f"\n  [{i}/{len(questions)}] Google ({model_name}) - {question}")
                     result = test_question(question, group_prompt, "google", model_name,
-                                         db_name=group_db_name, db_config=group_db_config)
+                                         db_name=group_db_name, db_config=group_db_config,
+                                         allowed_tables=group_allowed_tables)
                     result["group_name"] = group_name
                     all_results["google"][model_name].append(result)
                     if result.get("is_dangerous"):
@@ -923,7 +1032,8 @@ def run_tests(testcase_file: str, openai_model: str = None, google_model: str = 
                 for i, question in enumerate(questions, 1):
                     print(f"\n  [{i}/{len(questions)}] OpenAI ({model_name}) - {question}")
                     result = test_question(question, group_prompt, "openai", model_name, 
-                                         db_name=group_db_name, db_config=group_db_config)
+                                         db_name=group_db_name, db_config=group_db_config,
+                                         allowed_tables=group_allowed_tables)
                     result["group_name"] = group_name
                     all_results["openai"][model_name].append(result)
                     if result.get("is_dangerous"):
@@ -1072,12 +1182,49 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # 检查环境变量
-    if openai and not os.getenv("OPENAI_API_KEY"):
-        print("警告: 未设置 OPENAI_API_KEY 环境变量")
+    # 检查环境变量并显示诊断信息
+    print("\n" + "=" * 80)
+    print("环境变量检查")
+    print("=" * 80)
     
-    if genai and not os.getenv("GOOGLE_API_KEY"):
-        print("警告: 未设置 GOOGLE_API_KEY 环境变量")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai:
+        if openai_key:
+            print(f"✓ OPENAI_API_KEY 已设置 (前缀: {openai_key[:10]}...)")
+        else:
+            print("✗ 警告: 未设置 OPENAI_API_KEY 环境变量")
+            print("  提示: 请在 .env 文件中设置 OPENAI_API_KEY 或使用环境变量")
+    else:
+        print("⚠ OpenAI 库未安装，跳过检查")
+    
+    google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if genai:
+        if google_key:
+            google_key = google_key.strip()
+            print(f"✓ GOOGLE_API_KEY 已设置 (前缀: {google_key[:10]}..., 长度: {len(google_key)} 字符)")
+            
+            # 验证 API Key 格式
+            if len(google_key) < 20:
+                print("  ⚠ 警告: API Key 长度过短，可能格式不正确")
+            elif not google_key.startswith("AIza"):
+                print("  ⚠ 警告: API Key 不以 'AIza' 开头")
+                print("  提示: 请确认使用的是 Google AI Studio 的 API Key")
+                print("        不要使用 Google Cloud Console 的 API Key")
+            else:
+                print("  ✓ API Key 格式看起来正确（以 'AIza' 开头）")
+            
+            print("  重要: 必须使用 Google AI Studio 的 API Key")
+            print("        https://makersuite.google.com/app/apikey")
+            print("        不要使用 Google Cloud Console 的 API Key")
+        else:
+            print("✗ 警告: 未设置 GOOGLE_API_KEY 或 GEMINI_API_KEY 环境变量")
+            print("  提示: 请在 .env 文件中设置 GOOGLE_API_KEY 或使用环境变量")
+            print("        Google AI Studio: https://makersuite.google.com/app/apikey")
+            print("        注意: 必须使用 Google AI Studio 的 API Key，不是 Google Cloud Console 的")
+    else:
+        print("⚠ Google Generative AI 库未安装，跳过检查")
+    
+    print("=" * 80 + "\n")
     
     run_tests(args.testcase, args.openai_model, args.google_model)
 
